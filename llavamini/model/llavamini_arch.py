@@ -168,6 +168,70 @@ class Resampler(nn.Module):
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
 
+
+class DynamicResampler_v2(nn.Module):
+    """DynamicResampler with a learnable soft mask and optional hard mode."""
+    def __init__(self, grid_size, embed_dim, num_heads,
+                 kv_dim=None, norm_layer=nn.LayerNorm, max_queries=None, hidden_dim=128):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_queries = grid_size ** 2 if max_queries is None else max_queries
+
+        grid_big = math.ceil(math.sqrt(self.max_queries))
+        pe = get_2d_sincos_pos_embed(embed_dim, grid_big)[: self.max_queries]
+        self.pos_embed = nn.Parameter(torch.from_numpy(pe), requires_grad=False)
+
+        self.query = nn.Parameter(torch.zeros(self.max_queries, embed_dim))
+        self.query.data.normal_(0, 0.02)
+
+        self.kv_proj = nn.Identity() if kv_dim in (None, embed_dim) else nn.Linear(kv_dim, embed_dim, bias=False)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.ln_q = norm_layer(embed_dim)
+        self.ln_kv = norm_layer(embed_dim)
+
+        nn.init.constant_(self.ln_q.bias, 0)
+        nn.init.constant_(self.ln_q.weight, 1)
+        nn.init.constant_(self.ln_kv.bias, 0)
+        nn.init.constant_(self.ln_kv.weight, 1)
+
+        self.soft_mode = True
+        self.threshold = 0.5
+
+        self.mask_mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, max_queries)
+        )
+
+    def init_weights(self):
+        """Initialize learnable parameters similar to :class:`Resampler`."""
+        self.query.data.normal_(mean=0.0, std=0.02)
+        nn.init.constant_(self.ln_q.bias, 0)
+        nn.init.constant_(self.ln_q.weight, 1.0)
+        nn.init.constant_(self.ln_kv.bias, 0)
+        nn.init.constant_(self.ln_kv.weight, 1.0)
+
+    def set_mode(self, soft: bool = True):
+        self.soft_mode = soft
+
+    def forward(self, x, image_feat):
+        B, _, D = x.shape
+
+        logits = self.mask_mlp(image_feat)
+        if self.soft_mode:
+            mask = torch.sigmoid(logits)
+        else:
+            mask = (torch.sigmoid(logits) > self.threshold).float()
+
+        query = self.query.unsqueeze(0).expand(B, -1, -1) + self.pos_embed.unsqueeze(0)
+        query = self.ln_q(query)
+        query = query * mask.unsqueeze(-1)
+
+        x_kv = self.ln_kv(self.kv_proj(x))
+        out, _ = self.attn(query, x_kv, x_kv)
+
+        return out
+
 class LlavaMiniMetaModel:
 
     def __init__(self, config):
@@ -195,10 +259,11 @@ class LlavaMiniMetaModel:
             self.prefusion_layers.to(self.base_model.device).to(self.base_model.dtype)
             
         self.compressor_size= getattr(config,'compressor_size', 2)
-        self.compressor=Resampler(
+        self.compressor=DynamicResampler_v2(
             grid_size=self.compressor_size,
-            embed_dim=1024,
+            embed_dim=self.get_vision_tower().hidden_size,
             num_heads=8,
+            max_queries=self.compressor_size * self.compressor_size,
         )
         if self.base_model.device.type != 'meta':
             self.compressor.to(self.base_model.device).to(self.base_model.dtype)
@@ -358,13 +423,18 @@ class LlavaMiniMetaForCausalLM(ABC):
                 org_grid=int(math.sqrt(spa_len))
                 split_ratio=1
 
-                image_features=clip_image_features
-                global_image_features=clip_image_features
-                
-                compressed_image_features,attn=self.get_model().compressor(image_features)
+                patch_num = self.get_model().get_vision_tower().num_patches
+                if spa_len == patch_num + 1:
+                    image_features = clip_image_features[:, 1:]
+                    cls_feat = clip_image_features[:, 0]
+                else:
+                    image_features = clip_image_features
+                    cls_feat = clip_image_features.mean(dim=1)
+
+                compressed_image_features=self.get_model().compressor(image_features, cls_feat)
 
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
-                global_image_features=self.get_model().mm_projector(global_image_features)
+                global_image_features=self.get_model().mm_projector(cls_feat.unsqueeze(1))
 
                 x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)
                 mask=torch.cat((torch.zeros((padding_mask.size(0),global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
@@ -383,13 +453,14 @@ class LlavaMiniMetaForCausalLM(ABC):
                 hd_image_features=clip_image_features[:,:hd_ratio*hd_ratio].view(bsz,hd_ratio,hd_ratio,org_grid,org_grid,d_im).transpose(2,3).reshape(bsz,hd_ratio*org_grid,hd_ratio*org_grid,d_im)
                 hd_image_features=hd_image_features.view(bsz,split_ratio,hd_ratio*org_grid//split_ratio,split_ratio,hd_ratio*org_grid//split_ratio,d_im).transpose(2,3).reshape(bsz*split_ratio*split_ratio,-1,d_im)
 
-                global_image_features=clip_image_features[:,-1]
-                
-                compressed_image_features,attn=self.get_model().compressor(hd_image_features)
+                cls_feat = clip_image_features[:,-1]
+                repeat_cls = cls_feat.repeat_interleave(split_ratio*split_ratio, dim=0)
+
+                compressed_image_features=self.get_model().compressor(hd_image_features, repeat_cls)
 
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 compressed_image_features=compressed_image_features.view(bsz,split_ratio*split_ratio,compressed_image_features.size(-2),compressed_image_features.size(-1)).reshape(bsz,-1,compressed_image_features.size(-1))
-                global_image_features=self.get_model().mm_projector(global_image_features)
+                global_image_features=self.get_model().mm_projector(cls_feat.unsqueeze(1))
 
                 d=global_image_features.size(-1)
                 hd_image_features_all=self.get_model().mm_projector(clip_image_features[:,:-1]).view(bsz,hd_ratio,hd_ratio,org_grid,org_grid,-1).transpose(2,3).reshape(bsz,-1,d)
